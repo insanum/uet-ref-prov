@@ -387,6 +387,34 @@ When the impairment shim is enabled, the `UET_PKT_DROP_THRESH` environment
 variable is ignored as the impairment shim provides its own drop mechanism via
 the TOML configuration.
 
+## UET Reference Device Model
+
+The reference implementation can also be driven as an **emulated PCIe
+device** rather than linked into an application. `uet_vfio/` holds a
+[libvfio-user](https://github.com/nutanix/libvfio-user) server, `uet_dev`,
+that presents this stack to a QEMU guest as a PCI function. The guest binds
+a kernel driver to it, registers an `ib_device` and a `netdev`, and runs
+unmodified UET verbs applications (i.e., `ibv_ru_pingpong` and `ibv_ru_rma`)
+with every operation served by the SES, PDS, and TSS code in this
+repository.
+
+It exists to develop a UET kernel driver and a UET verbs provider against a
+device whose behaviour is defined here rather than by a vendor, with no
+hardware involved.
+
+```
+% make dev
+```
+
+`dev` is not part of the default build, so the standalone application and
+its regression matrix are unaffected.
+
+See [uet_vfio/README.md](uet_vfio/README.md) for the overview, how to build
+it, how to provision a machine to run it, and how to test it.
+
+See [uet_vfio/REGISTERS.md](uet_vfio/REGISTERS.md) for documentation on
+the device model and exposed PCIe BARs detailing every register.
+
 ## Contributing
 
 Code changes, fixes, enhancements, etc are encouraged and greatly welcome!
