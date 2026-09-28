@@ -46,6 +46,13 @@ struct uet_nic_info {
 	enum uet_nic_link_state link_state;
 };
 
+/* loopback packet */
+struct uet_nic_lo_pkt {
+	struct uet_nic_lo_pkt *next;
+	size_t                 len;
+	uint8_t                data[];
+};
+
 /* nic control block structure - field of struct uet_instance */
 struct uet_nic {
 	char ifname[IFNAMSIZ];
@@ -76,6 +83,11 @@ struct uet_nic {
 	size_t max_pkt_size;             /* max packet size in bytes */
 
 	uint8_t uet_ipproto;           /* ip protocol number for uet */
+
+	/* frames sent to our own MAC, waiting to be received */
+	struct uet_nic_lo_pkt *lo_head;
+	struct uet_nic_lo_pkt *lo_tail;
+	uint32_t               lo_depth;
 
 	int sock_fd;                    /* socket fd for ioctl calls */
 	void *nic_priv_data;
@@ -184,6 +196,22 @@ int uet_nic_resolve_ipv6_nh(struct uet_nic *nic,
 int uet_nic_initialize(struct uet_nic *nic);
 
 /*
+ * loopback interface
+ *   A frame addressed to this device's own MAC is delivered to the
+ *   loopback queue rather than transmitted out the shim.
+ */
+bool uet_nic_is_loopback(const struct uet_nic *nic,
+			 const void *pkt);
+int uet_nic_loopback_tx(struct uet_nic *nic,
+			const void *pkt,
+			size_t len);
+int uet_nic_loopback_rx(struct uet_nic *nic,
+			void *pkt,
+			size_t buf_size,
+			size_t *rx_len);
+void uet_nic_loopback_drain(struct uet_nic *nic);
+
+/*
  * free nic resources
  *
  * parms:
@@ -191,6 +219,8 @@ int uet_nic_initialize(struct uet_nic *nic);
  */
 static inline void uet_nic_finalize(struct uet_nic *nic)
 {
+	uet_nic_loopback_drain(nic);
+
 	if (!nic)
 		assert(0);
 
@@ -303,6 +333,10 @@ static inline int uet_nic_tx_pkt(struct uet_nic *nic,
 	if (!nic || !pkt || !pkt_size)
 		assert(0);
 
+	/* send to loopback if addressed to ourself */
+	if (uet_nic_is_loopback(nic, pkt))
+		return uet_nic_loopback_tx(nic, pkt, pkt_size);
+
 	return nic->nic_tx_pkt(nic, pkt, iphdr, pkt_size);
 }
 
@@ -326,8 +360,15 @@ static inline int uet_nic_rx_pkt(struct uet_nic *nic,
 				 size_t pkt_buf_size,
 				 size_t *rx_pkt_size)
 {
+	int rc;
+
 	if (!nic || !pkt || !pkt_buf_size || !rx_pkt_size)
 		assert(0);
+
+	/* loopback frames first (they are already here) */
+	rc = uet_nic_loopback_rx(nic, pkt, pkt_buf_size, rx_pkt_size);
+	if (rc != 0)
+		return rc;
 
 	return nic->nic_rx_pkt(nic, pkt, pkt_buf_size, rx_pkt_size);
 }
@@ -347,6 +388,9 @@ static inline int uet_nic_rx_poll(struct uet_nic *nic)
 {
 	if (!nic)
 		assert(0);
+
+	if (nic->lo_head != NULL)
+		return 1;
 
 	return nic->nic_rx_poll(nic);
 }

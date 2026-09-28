@@ -220,6 +220,27 @@ struct uet_ses_to_pds_funcs {
 	 *               being closed
 	 */
 	void (*ep_close_wait)(struct uet_ep *uet_ep);
+
+	/*
+	 * drop every queued packet that names a ses transmit handle
+	 *
+	 * called when ses abandons a transmit, a queue pair being
+	 * destroyed or work being cancelled, so that nothing the pds still
+	 * holds refers to a descriptor ses is about to recycle
+	 *
+	 * pds must not make the pds_err upcall for what it drops here ad the
+	 * caller is already completing that descriptor
+	 *
+	 * parms:
+	 *      uet_ep        - ptr to uet endpoint struct
+	 *      tx_pkt_handle - handle assigned to the packets by ses when
+	 *                      their transmission was initiated
+	 *
+	 * returns:
+	 *      the number of packets dropped
+	 */
+	size_t (*drop_tx_pkts)(struct uet_ep *uet_ep,
+			       uet_pkt_handle_t tx_pkt_handle);
 };
 
 struct uet_pds_to_ses_funcs {

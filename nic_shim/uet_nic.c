@@ -15,6 +15,7 @@
 #include <net/if_arp.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
+#include <arpa/inet.h>
 
 #include "uet_api_private.h"
 #include "uet_nic.h"
@@ -26,6 +27,29 @@ int uet_nic_get_ipv4_addr(int sock_fd,
 			  char *ipv4_addr_str)
 {
 	char *ip;
+	struct in_addr in;
+	const char *ip_override;
+
+	/* When this instance runs behind a PCIe device model, the guest owns
+	 * the network identity and the host interface carries no address at
+	 * all. The ioctl below would fail and leave the instance with no
+	 * source address for UET headers. The UET_LOCAL_IP env var supplies
+	 * it.
+	 */
+	ip_override = getenv("UET_LOCAL_IP");
+	if ((ip_override != NULL) && (*ip_override != '\0')) {
+		if (inet_pton(AF_INET, ip_override, &in) != 1) {
+			UET_API_ERR("UET_LOCAL_IP is not an IPv4 address: %s",
+				    ip_override);
+			return -EINVAL;
+		}
+
+		*ipv4_addr = ntohl(in.s_addr);
+		strncpy(ipv4_addr_str, ip_override, INET_ADDRSTRLEN - 1);
+		ipv4_addr_str[INET_ADDRSTRLEN - 1] = '\0';
+
+		return 0;
+	}
 
 	ifr->ifr_addr.sa_family = AF_INET;
 	if ((ioctl(sock_fd, SIOCGIFADDR, ifr)) < 0)
@@ -110,6 +134,92 @@ int uet_nic_get_ipv6_addr(const char *ifname,
 	return -ENOENT;
 }
 
+/*
+ * Read an entry out of the kernel's neighbour cache.
+ *
+ * Returns 1 when an entry with a link-layer address was found, 0 when
+ * there is none, and a negative errno on failure. With permanent_only the
+ * entry must also be PERMANENT - one an operator configured rather than
+ * one the kernel learned - which is the only kind safe to trust without
+ * re-probing.
+ */
+static int uet_nic_neigh_lookup(const char *ifname,
+				const char *nh_str,
+				bool ipv6,
+				bool permanent_only,
+				uint8_t *mac)
+{
+	char sys_cmd[UET_MAX_SYS_CMD_OCTETS];
+	char line[256];
+	FILE *cmd_stream;
+	char *lladdr;
+	unsigned int m[6];
+	int i;
+
+	snprintf(sys_cmd, sizeof(sys_cmd),
+		 "ip %s neigh show %s dev %s 2>/dev/null",
+		 ipv6 ? "-6" : "-4", nh_str, ifname);
+
+	cmd_stream = popen(sys_cmd, "r");
+	if (cmd_stream == NULL)
+		return -EIO;
+
+	memset(line, 0, sizeof(line));
+
+	if (fgets(line, sizeof(line), cmd_stream) == NULL) {
+		pclose(cmd_stream);
+		return 0;
+	}
+
+	pclose(cmd_stream);
+
+	if (permanent_only && (strstr(line, "PERMANENT") == NULL))
+		return 0;
+
+	lladdr = strstr(line, "lladdr ");
+	if (lladdr == NULL)
+		return 0;
+
+	lladdr += 7;
+
+	if (sscanf(lladdr, "%x:%x:%x:%x:%x:%x",
+		   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) != 6) {
+		return 0;
+	}
+
+	for (i = 0; i < ETH_ALEN; i++)
+		mac[i] = (uint8_t)m[i];
+
+	return 1;
+}
+
+/*
+ * Load the neighbour cache for a next hop by probing it.
+ *
+ * The existing entry is dropped first so a stale one cannot be picked up,
+ * then a single echo request makes the kernel resolve the address.
+ */
+static void uet_nic_neigh_probe(const char *ifname,
+				const char *nh_str,
+				bool ipv6)
+{
+	char sys_cmd[UET_MAX_SYS_CMD_OCTETS];
+
+	snprintf(sys_cmd, sizeof(sys_cmd),
+		 "ip %s neigh del %s dev %s 2>/dev/null 1>/dev/null",
+		 ipv6 ? "-6" : "-4", nh_str, ifname);
+
+	if (system(sys_cmd) == -1)
+		UET_API_ERR("Error clearing neighbor cache entry");
+
+	snprintf(sys_cmd, sizeof(sys_cmd),
+		 "ping %s -c 1 -W 1 -I %s %s 2>/dev/null 1>/dev/null",
+		 ipv6 ? "-6" : "-4", ifname, nh_str);
+
+	if (system(sys_cmd) == -1)
+		UET_API_ERR("Error probing next hop");
+}
+
 /* resolve next-hop info for ipv4 destination address */
 int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
 			    int sock_fd,
@@ -129,6 +239,31 @@ int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
 	net_order = htonl(dst_ip);
 	inet_ntop(AF_INET, (char *)&net_order, nic->dst_ip_addr_str,
 		  INET_ADDRSTRLEN);
+
+	/*
+	 * Our own address resolves to our own MAC, and the frame is then
+	 * looped back rather than transmitted.
+	 *
+	 * The kernel cannot answer this: a local address is not a
+	 * neighbour, so the route and neighbour lookups below find nothing
+	 * and resolution fails. Answering it here is what lets two queue
+	 * pairs on one device reach each other.
+	 */
+	if (nic->has_ipv4 && (dst_ip == nic->ipv4_addr)) {
+		memcpy(mac, nic->mac_addr, ETH_ALEN);
+		strncpy(nic->nh_ip_addr_str, nic->dst_ip_addr_str,
+			INET6_ADDRSTRLEN - 1);
+		nic->nh_ip_addr_str[INET6_ADDRSTRLEN - 1] = '\0';
+
+		printf("Next-Hop Address Resolution\n");
+		printf("  Destination IPv4 Addr: %s\n", nic->dst_ip_addr_str);
+		printf("  Next-Hop IPv4 Addr:    %s (loopback)\n",
+		       nic->nh_ip_addr_str);
+		printf("  Next-Hop MAC Addr:     ");
+		uet_print_mac_addr(mac);
+
+		return 0;
+	}
 
 	/* find next-hop ipv4 address */
 	strcpy(sys_cmd, "ip route get to ");
@@ -156,19 +291,19 @@ int uet_nic_resolve_ipv4_nh(struct uet_nic *nic,
 	inet_pton(AF_INET, nic->nh_ip_addr_str, &nh_ipv4);
 	pclose(cmd_stream);
 
-	/* delete any entry for next-hop already in arp cache */
-	strcpy(sys_cmd, "arp -d ");
-	strcat(sys_cmd, nic->nh_ip_addr_str);
-	strcat(sys_cmd, " 2> /dev/null 1> /dev/null");
-	system(sys_cmd);
+	/* an operator-configured entry is the answer */
+	if (uet_nic_neigh_lookup(nic->ifname, nic->nh_ip_addr_str, false,
+				 true, mac) == 1) {
+		printf("Next-Hop Address Resolution\n");
+		printf("  Destination IPv4 Addr: %s\n", nic->dst_ip_addr_str);
+		printf("  Next-Hop IPv4 Addr:    %s (permanent)\n",
+		       nic->nh_ip_addr_str);
+		printf("  Next-Hop MAC Addr:     ");
+		uet_print_mac_addr(mac);
+		return 0;
+	}
 
-	/* ping next hop to load arp cache using our interface */
-	strcpy(sys_cmd, "ping -c 1 -I ");
-	strcat(sys_cmd, nic->ifname);
-	strcat(sys_cmd, " ");
-	strcat(sys_cmd, nic->nh_ip_addr_str);
-	strcat(sys_cmd, " 2> /dev/null 1> /dev/null");
-	system(sys_cmd);
+	uet_nic_neigh_probe(nic->ifname, nic->nh_ip_addr_str, false);
 
 	/* read next-hop mac address from arp cache */
 	memset(&areq, 0, sizeof(areq));
@@ -216,6 +351,23 @@ int uet_nic_resolve_ipv6_nh(struct uet_nic *nic,
 	/* convert ipv6 addr to string */
 	inet_ntop(AF_INET6, dst_ip6, nic->dst_ip_addr_str, INET6_ADDRSTRLEN);
 
+	/* our own address for loopback, see the IPv4 path above */
+	if (nic->has_ipv6 && (memcmp(dst_ip6, nic->ipv6_addr, 16) == 0)) {
+		memcpy(mac, nic->mac_addr, ETH_ALEN);
+		strncpy(nic->nh_ip_addr_str, nic->dst_ip_addr_str,
+			INET6_ADDRSTRLEN - 1);
+		nic->nh_ip_addr_str[INET6_ADDRSTRLEN - 1] = '\0';
+
+		printf("Next-Hop Address Resolution\n");
+		printf("  Destination IPv6 Addr: %s\n", nic->dst_ip_addr_str);
+		printf("  Next-Hop IPv6 Addr:    %s (loopback)\n",
+		       nic->nh_ip_addr_str);
+		printf("  Next-Hop MAC Addr:     ");
+		uet_print_mac_addr(mac);
+
+		return 0;
+	}
+
 	/* find next-hop ipv6 address using ip -6 route get */
 	snprintf(sys_cmd, sizeof(sys_cmd),
 		 "ip -6 route get %s oif %s 2>/dev/null | head -1",
@@ -249,17 +401,19 @@ int uet_nic_resolve_ipv6_nh(struct uet_nic *nic,
 			INET6_ADDRSTRLEN);
 	}
 
-	/* delete any entry for next-hop already in neighbor cache */
-	snprintf(sys_cmd, sizeof(sys_cmd),
-		 "ip -6 neigh del %s dev %s 2>/dev/null 1>/dev/null",
-		 nic->nh_ip_addr_str, nic->ifname);
-	system(sys_cmd);
+	/* an operator-configured entry is the answer */
+	if (uet_nic_neigh_lookup(nic->ifname, nic->nh_ip_addr_str, true,
+				 true, mac) == 1) {
+		printf("Next-Hop Address Resolution\n");
+		printf("  Destination IPv6 Addr: %s\n", nic->dst_ip_addr_str);
+		printf("  Next-Hop IPv6 Addr:    %s (permanent)\n",
+		       nic->nh_ip_addr_str);
+		printf("  Next-Hop MAC Addr:     ");
+		uet_print_mac_addr(mac);
+		return 0;
+	}
 
-	/* ping6 next hop to trigger NDP */
-	snprintf(sys_cmd, sizeof(sys_cmd),
-		 "ping -6 -c 1 -I %s %s 2>/dev/null 1>/dev/null",
-		 nic->ifname, nic->nh_ip_addr_str);
-	system(sys_cmd);
+	uet_nic_neigh_probe(nic->ifname, nic->nh_ip_addr_str, true);
 
 	/* read next-hop mac address from neighbor cache */
 	snprintf(sys_cmd, sizeof(sys_cmd),
@@ -304,6 +458,107 @@ int uet_nic_resolve_ipv6_nh(struct uet_nic *nic,
 	uet_print_mac_addr(mac);
 
 	return rc;
+}
+
+/*
+ * Loopback. A frame whose destination is this device's own MAC is
+ * delivered to this device's loopback channel rather than transmitted.
+ *
+ * Handled at the shim rather than in either backend, so raw sockets and
+ * XDP behave the same way and neither has to know about it.
+ *
+ * The queue is bounded. A device that loops back faster than it receives
+ * would otherwise grow it without limit, and dropping is what the wire
+ * would do to a peer that stopped reading.
+ */
+
+#define UET_NIC_LO_MAX_DEPTH 1024
+
+bool uet_nic_is_loopback(const struct uet_nic *nic,
+			 const void *pkt)
+{
+	const struct ethhdr *eth = pkt;
+
+	if ((nic == NULL) || (pkt == NULL))
+		return false;
+
+	return (memcmp(eth->h_dest, nic->mac_addr, ETH_ALEN) == 0);
+}
+
+int uet_nic_loopback_tx(struct uet_nic *nic,
+			const void *pkt,
+			size_t len)
+{
+	struct uet_nic_lo_pkt *lo;
+
+	if (nic->lo_depth >= UET_NIC_LO_MAX_DEPTH)
+		return -ENOBUFS;
+
+	lo = malloc(sizeof(*lo) + len);
+	if (lo == NULL)
+		return -ENOMEM;
+
+	lo->next = NULL;
+	lo->len  = len;
+	memcpy(lo->data, pkt, len);
+
+	if (nic->lo_tail != NULL)
+		nic->lo_tail->next = lo;
+	else
+		nic->lo_head = lo;
+
+	nic->lo_tail = lo;
+	nic->lo_depth++;
+
+	return 0;
+}
+
+/* returns 1 when a frame was delivered, 0 when there is none */
+int uet_nic_loopback_rx(struct uet_nic *nic,
+			void *pkt,
+			size_t buf_size,
+			size_t *rx_len)
+{
+	struct uet_nic_lo_pkt *lo = nic->lo_head;
+
+	if (lo == NULL)
+		return 0;
+
+	nic->lo_head = lo->next;
+
+	if (nic->lo_head == NULL)
+		nic->lo_tail = NULL;
+
+	nic->lo_depth--;
+
+	/* a frame too big for the caller's buffer is dropped */
+	if (lo->len > buf_size) {
+		free(lo);
+		return 0;
+	}
+
+	memcpy(pkt, lo->data, lo->len);
+	*rx_len = lo->len;
+
+	free(lo);
+
+	return 1;
+}
+
+void uet_nic_loopback_drain(struct uet_nic *nic)
+{
+	struct uet_nic_lo_pkt *lo;
+
+	if (nic == NULL)
+		return;
+
+	while ((lo = nic->lo_head) != NULL) {
+		nic->lo_head = lo->next;
+		free(lo);
+	}
+
+	nic->lo_tail = NULL;
+	nic->lo_depth = 0;
 }
 
 int uet_nic_getinfo(struct uet_nic *nic,

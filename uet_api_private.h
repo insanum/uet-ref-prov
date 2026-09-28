@@ -210,6 +210,10 @@ struct uet_mr_desc {
 	uint64_t base_va;
 	uint32_t job_id;                 /* JobID the region is restricted to */
 	bool job_restricted;               /* region is restricted to a JobID */
+	     /* Which keys an incoming request must match to resolve this     */
+	     /* region. The RI classes are scoped to uet_ep above. The others */
+	     /* are scoped to uet_dom and leave uet_ep NULL.                  */
+	uet_mr_access_class_t access_class;
 	bool user_key;            /* key is user-assigned (hash space) vs the */
 				  /* provider-assigned index space            */
 	void *context;                                      /* for completion */
@@ -562,6 +566,11 @@ struct uet_ep; /* forward reference */
 
 /* control block for uet instance */
 struct uet_instance {
+	     /* Optional address translation function for memory-region page  */
+	     /* lists. NULL means the identity. See uet_set_dma_xlate().      */
+	uet_dma_xlate_fn dma_xlate;
+	void *dma_xlate_ctx;
+
 	struct dlist_entry domain_list_head;          /* domain obj list head */
 	struct uet_nic nic;                              /* nic control block */
 	uint8_t uet_ipproto;                    /* ip protocol number for uet */
@@ -610,6 +619,12 @@ struct uet_domain {
 	uet_eq_err_callback_t eq_err_callback;    /* err event callback */
 	size_t num_mr;            /* number of memory regions supported */
 	struct uet_mr_desc *mr_desc;  /* ptr to array of mr descriptors */
+	   /* Lookup spaces for domain-scoped regions. The unrestricted and  */
+	   /* job-restricted classes which any endpoint in the domain may    */
+	   /* resolve. They mirror the per-endpoint spaces. Which of the two */
+	   /* a region lands in is decided by its access class.              */
+	struct uet_mr_desc *mr_hash_table;    /* user keys, domain scoped */
+	struct dlist_entry mr_list_head;  /* provider keys, domain scoped */
 	   /* used for managing allocation of memory region descriptors */
 	struct uet_mr_desc_alloc_cb mr_desc_alloc_cb;
 };
@@ -664,6 +679,12 @@ struct uet_ep {
 	struct uet_addr uet_addr;               /* uet addr of ep, host order */
 	struct uet_fa ip_addr;                   /* ip addr of ep, host order */
 	struct uet_ep_key ep_key;                  /* key for endpoint lookup */
+		/* Largest payload this endpoint will put in a packet. Taken
+		 * from the instance unless the caller asked for less. Verbs
+		 * carries a path MTU per queue pair, and a queue pair is an
+		 * endpoint.
+		 */
+	size_t max_payload_len;                   /* max payload for a packet */
 	uint8_t msg_ip_tos;                            /* ip tos for messages */
 	struct uet_cq send_cq;                       /* send completion queue */
 	struct uet_cq recv_cq;                    /* receive completion queue */

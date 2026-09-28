@@ -379,6 +379,28 @@ int uet_mr_reg_job(uet_domain_handle_t domain_handle, const void *buf,
 		   uet_mr_handle_t *mr_handle);
 
 /*
+ * install an address translation for this instance
+ *
+ * Memory regions may be described by addresses that mean nothing to this
+ * process (i.e., the page list of a guest's region behind a PCIe device
+ * model) The translation turns one into a pointer this process can
+ * dereference for the length requested, or NULL if it cannot.
+ *
+ * The default is the identity, so an instance that owns its own memory
+ * needs no translation and behaves exactly as before.
+ *
+ * parms:
+ *   handle - handle identifying uet instance
+ *   fn     - translation, or NULL to restore the identity
+ *   ctx    - passed back to fn
+ *
+ * returns:
+ *   FI_SUCCESS, or negative errno
+ */
+typedef void *(*uet_dma_xlate_fn)(void *ctx, uet_dma_addr_t addr, size_t len);
+int uet_set_dma_xlate(uet_handle_t handle, uet_dma_xlate_fn fn, void *ctx);
+
+/*
  * register a memory region described by a page buffer list
  *
  * This is the registration a device driver performs: the pages behind a
@@ -417,6 +439,27 @@ int uet_mr_reg_pbl(uet_domain_handle_t domain_handle, uet_dma_addr_t pbl_root,
 		   uint32_t page_offset, uint64_t base_va, size_t len,
 		   uint64_t access, uint64_t requested_key, uint64_t flags,
 		   void *context, uet_mr_handle_t *mr_handle);
+
+/*
+ * read bytes out of a registered memory region
+ *
+ * Resolves the region however it is described as contiguous, a vector, or a
+ * page list walked through the instance's address translation, and copies
+ * data into a flat buffer. Intended for a caller that owns the region on
+ * behalf of somebody else, such as a device model reading a guest's memory.
+ *
+ * parms:
+ *   mr_handle - handle identifying uet memory region instance
+ *   offset    - byte offset into the region
+ *   buf       - destination
+ *   len       - bytes to read
+ *
+ * returns:
+ *   bytes copied, which is less than len only if the range is not fully
+ *   resolvable
+ */
+size_t uet_mr_read(uet_mr_handle_t mr_handle, size_t offset, void *buf,
+		   size_t len);
 
 /*
  * get memory region protection key
@@ -469,6 +512,56 @@ uint64_t uet_mr_refresh(uet_mr_handle_t mr_handle,
 			size_t count, uint64_t flags);
 
 /*
+ * how a memory region may be reached
+ *
+ * A region is always scoped to its domain (the PD). The access class says
+ * what else must match for an incoming request to resolve it, per the UET
+ * verbs MR access table:
+ *
+ *   UNRESTRICTED       { Device, PD }             any QP
+ *   RI_RESTRICTED      { Device, PD, QP }         one QP
+ *   JOB_RESTRICTED     { Device, PD, JobID }      any QP, one Job
+ *   RI_JOB_RESTRICTED  { Device, PD, QP, JobID }  one QP, one Job
+ *
+ * The RI classes are reached through one endpoint, and a region acquires
+ * one by being bound to it, uet_ep_bind_mr() narrows UNRESTRICTED to
+ * RI_RESTRICTED and JOB_RESTRICTED to RI_JOB_RESTRICTED. A region that is
+ * never bound stays domain-scoped.
+ *
+ * Job-restriction is meaningful only under absolute addressing. Relative
+ * addressing already carries the JobID in its lookup hierarchy.
+ */
+typedef enum {
+	UET_MR_ACCESS_UNRESTRICTED = 0,
+	UET_MR_ACCESS_RI_RESTRICTED,
+	UET_MR_ACCESS_JOB_RESTRICTED,
+	UET_MR_ACCESS_RI_JOB_RESTRICTED,
+} uet_mr_access_class_t;
+
+/*
+ * set the access class of a registered memory region
+ *
+ * Valid only between registration and enable since the access class decides
+ * which lookup space the region is inserted into. A region that is never
+ * given a class is unrestricted, and binding it to an endpoint narrows it
+ * to the matching RI class.
+ *
+ * job_id is read only for the job-restricted classes and ignored
+ * otherwise.
+ *
+ * parms:
+ *   mr_handle - handle identifying uet memory region instance
+ *   class     - access class to apply
+ *   job_id    - JobID to restrict to, for the job-restricted classes
+ *
+ * returns:
+ *   0 on success,
+ *   negative value corresponding to fabric errno on error
+ */
+int uet_mr_set_access(uet_mr_handle_t mr_handle,
+		      uet_mr_access_class_t class, uint32_t job_id);
+
+/*
  * enable a memory region
  *
  * parms:
@@ -504,6 +597,77 @@ int uet_mr_disable(uet_mr_handle_t mr_handle);
  */
 int uet_mr_close(uet_mr_handle_t mr_handle);
 
+/*
+ * the largest payload this instance will put in a packet
+ *
+ * The value an endpoint gets when it asks for no path MTU of its own, and
+ * the ceiling on one that does. Exposed so a caller that has to report a
+ * link MTU outwards, a verbs provider reporting active_mtu, can say what
+ * the instance actually does rather than assume the default.
+ *
+ * parms:
+ *   domain_handle - handle identifying uet domain instance
+ *
+ * returns:
+ *   the maximum payload in bytes, or 0 if the handle is not valid
+ */
+size_t uet_max_payload_len(uet_domain_handle_t domain_handle);
+
+/*
+ * the largest message this implementation will carry
+ *
+ * Not the payload MTU. A message is segmented across as many packets as it
+ * needs. Anything reporting a transport's message limit wants this one.
+ *
+ * returns:
+ *   the maximum message length in bytes
+ */
+size_t uet_max_msg_size(void);
+
+/*
+ * which encapsulation this instance puts UET on the wire in
+ *
+ * UET verbs identifies the transport underneath the SES and PDS headers by
+ * GID type, and an application picks the protocol by picking a GID entry
+ * Anything reporting a GID type has to ask what this instance actually
+ * transmits rather than assume.
+ *
+ * parms:
+ *   domain_handle - handle identifying uet domain instance
+ *
+ * returns:
+ *   the encapsulation in use, or UET_ENCAP_IP if the handle is not valid
+ */
+enum uet_encap {
+	UET_ENCAP_UDP,	/* UET over UDP/IP, on the UET UDP port */
+	UET_ENCAP_IP,	/* UET over IP, plus the PDS entropy header */
+	UET_ENCAP_UFH,	/* UET over the UFH header, for ULN */
+};
+
+enum uet_encap uet_tx_encap(uet_domain_handle_t domain_handle);
+
+/*
+ * abandon outstanding transmits on an endpoint
+ *
+ * Completes up to max of them with FI_ECANCELED, so an endpoint whose peer
+ * has stopped answering can be closed without waiting for the packet
+ * delivery sublayer to exhaust its retries.
+ *
+ * Bounded rather than all-at-once on purpose. Each completion goes into
+ * the endpoint's completion queue ring, which has no overflow protection,
+ * so a caller must be able to drain between calls the way it does in
+ * normal operation.
+ *
+ * parms:
+ *   ep_handle - handle identifying uet endpoint instance
+ *   max       - most to complete in this call
+ *
+ * returns:
+ *   the number completed, zero when there is nothing outstanding, or a
+ *   negative value corresponding to fabric errno on error
+ */
+ssize_t uet_ep_flush(uet_ep_handle_t ep_handle, size_t max);
+
 /*******************************************************************
  * uet_endpoint API family
  *******************************************************************/
@@ -520,6 +684,11 @@ int uet_mr_close(uet_mr_handle_t mr_handle);
  *   ep_handle     - ptr to location where uet endpoint handle
  *                   is returned
  *
+ * the verbs form also takes the endpoint's identity and the path_mtu which
+ * is the largest payload this endpoint may put in a packet, zero defaults
+ * to the instance's value and a custom path_mtu cannot be larger than the
+ * instance's
+ *
  * returns:
  *   0 on success,
  *   negative value corresponding to fabric errno on error
@@ -534,7 +703,7 @@ int uet_endpoint(uet_domain_handle_t domain_handle,
 		 void *context, uet_ep_handle_t *ep_handle,
 		 uint16_t pid_on_fep, uint16_t resource_index,
 		 uint32_t initiator_id, uint32_t job_id,
-		 bool absolute, bool is_ipv6);
+		 bool absolute, bool is_ipv6, uint32_t path_mtu);
 #endif
 
 /*

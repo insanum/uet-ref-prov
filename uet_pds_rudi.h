@@ -46,6 +46,11 @@ int uet_pds_rudi_tx_pkt(uet_pkt_handle_t tx_pkt_handle,
 			size_t pkt_len,
 			bool dma_rdy);
 
+/* Drop every outstanding RUDI request built from a SES transmit descriptor.
+ * Called from uet_pds_drop_tx_pkts().
+ */
+size_t uet_pds_rudi_drop_tx_pkts(uet_pkt_handle_t tx_pkt_handle);
+
 /* Progress RUDI engine intitiator side reliability. Driven from the PDS
  * engine's uet_pds_progress_tx().
  */
