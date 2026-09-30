@@ -826,6 +826,25 @@ int uet_pds_sng_msg_cmpl_ind(struct uet_ep *uet_ep,
 	return 0;
 }
 
+/* drop the outstanding transmits belonging to an abandoned SES handle */
+size_t uet_pds_sng_drop_tx_pkts(struct uet_ep *uet_ep,
+				uet_pkt_handle_t tx_pkt_handle)
+{
+	struct uet_pds_sng_state *pds_state =
+		(struct uet_pds_sng_state *)uet_ep->pds;
+
+	if ((tx_pkt_handle == NULL) || (pds_state == NULL))
+		return 0;
+
+	if (!pds_state->tx.tx_active ||
+	    (pds_state->tx.pkt_parms.tx_pkt_handle != tx_pkt_handle))
+		return 0;
+
+	pds_state->tx.tx_active = false;
+
+	return 1;
+}
+
 /* progress tx operations for endpoint */
 int uet_pds_sng_progress_tx(struct uet_ep *uet_ep,
 			    uet_pkt_handle_t *err_pkt_handle)

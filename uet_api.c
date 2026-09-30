@@ -1087,18 +1087,41 @@ static void uet_mr_key_init(struct uet_mr_key *key, struct uet_parsed_pkt *pp)
 		     UET_MR_KEY_RKEY_SHIFT);
 }
 
-/* insert entry into mr hash table */
-static void uet_mr_hash_insert(struct uet_ep *uet_ep,
-			       struct uet_mr_desc *mr_desc)
+/* A region is scoped either to one endpoint or to its whole domain,
+ * decided by its access class:
+ *
+ *   RI-restricted, RI-job-restricted  reachable through one QP  -> endpoint
+ *   unrestricted, job-restricted      reachable through any QP  -> domain
+ *
+ * The endpoint and the domain each carry a matching pair of lookup spaces
+ * (a hash for user-assigned keys, a list for provider-assigned ones), so
+ * this single predicate is what keeps insert, remove, and lookup agreeing
+ * on where a given region lives.
+ */
+static bool uet_mr_domain_scoped(const struct uet_mr_desc *mr_desc)
 {
-	HASH_ADD(mr_hh, uet_ep->mr_hash_table, hash_key,
-		 sizeof(struct uet_mr_key), mr_desc);
+	return ((mr_desc->access_class == UET_MR_ACCESS_UNRESTRICTED) ||
+		(mr_desc->access_class == UET_MR_ACCESS_JOB_RESTRICTED));
 }
 
-/* remove a single entry from the mr hash table of its endpoint */
+/* insert entry into mr hash table */
+static void uet_mr_hash_insert(struct uet_mr_desc *mr_desc)
+{
+	if (uet_mr_domain_scoped(mr_desc))
+		HASH_ADD(mr_hh, mr_desc->uet_dom->mr_hash_table, hash_key,
+			 sizeof(struct uet_mr_key), mr_desc);
+	else
+		HASH_ADD(mr_hh, mr_desc->uet_ep->mr_hash_table, hash_key,
+			 sizeof(struct uet_mr_key), mr_desc);
+}
+
+/* remove a single entry from the mr hash table it was inserted into */
 static void uet_mr_hash_remove(struct uet_mr_desc *mr_desc)
 {
-	HASH_DELETE(mr_hh, mr_desc->uet_ep->mr_hash_table, mr_desc);
+	if (uet_mr_domain_scoped(mr_desc))
+		HASH_DELETE(mr_hh, mr_desc->uet_dom->mr_hash_table, mr_desc);
+	else
+		HASH_DELETE(mr_hh, mr_desc->uet_ep->mr_hash_table, mr_desc);
 }
 
 /* remove all entries from mr hash table and free associated memory */
@@ -1113,13 +1136,44 @@ static void uet_mr_hash_finalize(struct uet_ep *uet_ep)
 	}
 }
 
-/* mr hash table lookup */
+/* release the domain's shared mr lookup spaces */
+static void uet_mr_domain_finalize(struct uet_domain *uet_dom)
+{
+	struct uet_mr_desc *current, *tmp;
+
+	HASH_ITER(mr_hh, uet_dom->mr_hash_table, current, tmp) {
+		HASH_DELETE(mr_hh, uet_dom->mr_hash_table, current);
+		current->state = UET_MR_DESC_STATE_DISABLED_REG;
+	}
+
+	while (!dlist_empty(&uet_dom->mr_list_head)) {
+		struct dlist_entry *item = uet_dom->mr_list_head.next;
+
+		dlist_remove(item);
+		container_of(item, struct uet_mr_desc, list_entry)->state =
+			UET_MR_DESC_STATE_DISABLED_REG;
+	}
+}
+
+/*
+ * mr hash table lookup, user-assigned key space
+ *
+ * The endpoint's own regions are searched first and the domain's shared
+ * ones second. A region reachable through only this QP takes precedence
+ * over one reachable through any of them. The two spaces are independent,
+ * so the same user key may name a different region in each.
+ */
 static struct uet_mr_desc *uet_mr_hash_lookup(
 		struct uet_ep *uet_ep, struct uet_mr_key *key)
 {
 	struct uet_mr_desc *mr_desc;
 
 	HASH_FIND(mr_hh, uet_ep->mr_hash_table, key,
+		  sizeof(struct uet_mr_key), mr_desc);
+	if (mr_desc)
+		return mr_desc;
+
+	HASH_FIND(mr_hh, uet_ep->uet_domain->mr_hash_table, key,
 		  sizeof(struct uet_mr_key), mr_desc);
 	return mr_desc;
 }
@@ -1365,11 +1419,15 @@ static void uet_tx_desc_recycle(struct uet_tx_desc *tx_desc,
 		uet_tx_desc_list_insert(tx_desc);
 }
 
-/* insert entry into list of memory regions for an endpoint */
+/* insert entry into the memory region list matching the region's scope */
 static void uet_mr_list_insert(struct uet_mr_desc *mr_desc)
 {
-	dlist_insert_head(&mr_desc->list_entry,
-			  &mr_desc->uet_ep->mr_list_head);
+	if (uet_mr_domain_scoped(mr_desc))
+		dlist_insert_head(&mr_desc->list_entry,
+				  &mr_desc->uet_dom->mr_list_head);
+	else
+		dlist_insert_head(&mr_desc->list_entry,
+				  &mr_desc->uet_ep->mr_list_head);
 }
 
 /* remove a single entry from the memory region list of its endpoint */
@@ -2102,6 +2160,8 @@ static void uet_domain_free(struct uet_domain *uet_dom)
 
 	item = &uet_dom->domain_list_entry;
 	dlist_remove(item);
+	uet_mr_domain_finalize(uet_dom);
+
 	if (uet_dom->mr_desc_alloc_cb.state)
 		free(uet_dom->mr_desc_alloc_cb.state);
 	if (uet_dom->mr_desc) {
@@ -2285,8 +2345,18 @@ struct uet_mr_desc *uet_get_mr_desc(struct uet_ep *uet_ep,
 	} else
 		mr_desc = uet_mr_hash_lookup(uet_ep, &mr_key);
 
-	/* Enforce job-restricted access as a region bound to a JobID may only
-	 * be accessed by requests within that job.
+	/* Enforce the region's access class. Both spaces above resolve within
+	 * the domain, which satisfies {Device, PD} on its own; what is left
+	 * is whatever else the class names.
+	 */
+	if (mr_desc && !uet_mr_domain_scoped(mr_desc) &&
+	    (mr_desc->uet_ep != uet_ep)) {
+		UET_API_ERR("MR access denied: Resource Index mismatch");
+		mr_desc = NULL;
+	}
+
+	/* A region bound to a JobID may only be accessed by requests within
+	 * that job.
 	 */
 	if (mr_desc && mr_desc->job_restricted) {
 		if (mr_desc->job_id != uet_get_std_req_job_id(ses)) {
@@ -2495,7 +2565,12 @@ static uet_ses_rc_t uet_get_rd_tx_desc(
 		if (uet_mr_gather(mr_desc, buf_off, rd_buf,
 				  pp->ses_payload_len) !=
 		    pp->ses_payload_len) {
-			UET_API_ERR("RX: Read Req: Invalid Buffer Offset");
+			UET_API_ERR("RX: Read Req: Invalid Buffer Offset: "
+				    "addr 0x%llx len %zu not within region "
+				    "[0x%llx, +%zu)",
+			    (unsigned long long)buf_off, (size_t)pp->ses_payload_len,
+			    (unsigned long long)mr_desc->base_va,
+			    (size_t)mr_desc->buf_desc.len);
 			free(rd_buf);
 			uet_tx_desc_list_insert(tx_desc);
 			*ret_tx_desc = NULL;
@@ -2637,14 +2712,20 @@ static uet_ses_rc_t uet_rx_rd_req_pkt(
 	/* resolve the address against the region and validate the range */
 	if (!uet_mr_addr_to_offset(mr_desc, buf_off, pp->ses_payload_len,
 				   &buf_off)) {
-		UET_API_ERR("RX: Read Req: Invalid Buffer Offset");
+		UET_API_ERR("RX: Read Req: Invalid Buffer Offset: "
+			    "addr 0x%llx len %zu not within region "
+			    "[0x%llx, +%zu)",
+			    (unsigned long long)buf_off,
+			    (size_t)pp->ses_payload_len,
+			    (unsigned long long)mr_desc->base_va,
+			    (size_t)mr_desc->buf_desc.len);
 		return UET_RC_BAD_ADDR;
 	}
 
 	/* check if data is to be carried in ack */
 	max_ack_data = uet_ep->uet_domain->uet->pds.max_ack_data;
 	if ((pp->pds_type == UET_PDS_TYPE_RUDI_REQ) ||
-	    (uet_ep->uet_domain->uet->max_payload_len == max_ack_data) ||
+	    (uet_ep->max_payload_len == max_ack_data) ||
 	    (req_len <= max_ack_data)) {
 		ack_d_info->valid = true;
 		ack_d_info->payload_len = pp->ses_payload_len;
@@ -2872,7 +2953,13 @@ static uet_ses_rc_t uet_rx_atomic_req_pkt(
 	/* resolve the address against the region and validate the range */
 	if (!uet_mr_addr_to_offset(mr_desc, start_off,
 				   UET_VERBS_ATOMIC_DATA_BYTES, &start_off)) {
-		UET_API_ERR("RX: Atomic Req: Invalid Buffer Offset");
+		UET_API_ERR("RX: Atomic Req: Invalid Buffer Offset: "
+			    "addr 0x%llx len %zu not within region "
+			    "[0x%llx, +%zu)",
+			    (unsigned long long)start_off,
+			    (size_t)UET_VERBS_ATOMIC_DATA_BYTES,
+			    (unsigned long long)mr_desc->base_va,
+			    (size_t)mr_desc->buf_desc.len);
 		ses_rc = UET_RC_BAD_ADDR;
 		goto err_exit;
 	}
@@ -3050,7 +3137,13 @@ static uet_ses_rc_t uet_rx_fetch_atomic_req_pkt(
 	/* resolve the address against the region and validate the range */
 	if (!uet_mr_addr_to_offset(mr_desc, start_off,
 				   UET_VERBS_ATOMIC_DATA_BYTES, &start_off)) {
-		UET_API_ERR("RX: Fetching Atomic Req: Invalid Buffer Offset");
+		UET_API_ERR("RX: Fetching Atomic Req: Invalid Buffer Offset: "
+			    "addr 0x%llx len %zu not within region "
+			    "[0x%llx, +%zu)",
+			    (unsigned long long)start_off,
+			    (size_t)UET_VERBS_ATOMIC_DATA_BYTES,
+			    (unsigned long long)mr_desc->base_va,
+			    (size_t)mr_desc->buf_desc.len);
 		return UET_RC_BAD_ADDR;
 	}
 
@@ -3269,19 +3362,29 @@ static size_t gather_iov_to_flat(
 	return dst_offset;
 }
 
-/*
- * Translate a dma address to something this process can dereference.
- *
- * FIXME: For future use with a device model does not own the memory its page
- * lists describe and only the device model can resolve them...
- */
+/* Translate a dma address to something this process can dereference. */
 static void *uet_dma_to_host(const struct uet_instance *uet,
 			     uet_dma_addr_t addr, size_t len)
 {
-	(void)uet;
+	if ((uet != NULL) && (uet->dma_xlate != NULL))
+		return uet->dma_xlate(uet->dma_xlate_ctx, addr, len);
+
 	(void)len;
 
 	return (void *)(uintptr_t)addr;
+}
+
+int uet_set_dma_xlate(uet_handle_t handle, uet_dma_xlate_fn fn, void *ctx)
+{
+	struct uet_instance *uet = (struct uet_instance *)handle;
+
+	if (uet == NULL)
+		return -FI_EINVAL;
+
+	uet->dma_xlate = fn;
+	uet->dma_xlate_ctx = ctx;
+
+	return FI_SUCCESS;
 }
 
 /*
@@ -3728,7 +3831,7 @@ static uet_ses_rc_t uet_rx_req_pkt(
 	ses = (struct uet_ses_req_std *) pp->ses;
 
 	*list = UET_EXPECTED; /* overflow list not supported */
-	max_payload_len = uet_ep->uet_domain->uet->max_payload_len;
+	max_payload_len = uet_ep->max_payload_len;
 	req_len = ntohl(ses->req_len);
 	if (write)
 		start_off = ntohll(ses->buf_off);
@@ -4465,6 +4568,23 @@ static int uet_pds_to_ses_rx_req(uet_pkt_handle_t rx_pkt_handle,
 		return -FI_EINVAL;
 	}
 
+	/* Size the first packet of a read from the endpoint, not the
+	 * instance. The endpoint is known now, so ask again with its MTU.
+	 *
+	 * A read request carries no payload, so the target has to be told
+	 * how much to return. Every packet of a read but the first says so
+	 * explicitly, in payload_len_msg_off, written by the initiator from
+	 * the Payload MTU. The first packet has ses.som set and that field
+	 * holds cmpl_data instead, so there is nowhere to put it and the
+	 * length is implied by the MTU alone.
+	 */
+	if ((pp->ses_opcode == UET_READ) &&
+	    (ses_std_req->cmn.ver_flags & UET_SES_REQ_FLAG_SOM)) {
+		pp->ses_payload_len =
+			uet_get_ses_req_payload_len(
+				pp, (uint16_t) uet_ep->max_payload_len);
+	}
+
 	switch (pp->ses_opcode) {
 	case UET_SEND:
 	case UET_DEFER_SEND:
@@ -4740,14 +4860,8 @@ static int uet_build_atomic_req_ses_hdr(struct uet_tx_desc *tx_desc,
 
 	ses->base.cmn.rsvd_pid_on_fep = htons(av->addr->pid_on_fep <<
 					      UET_SES_REQ_PID_ON_FEP_SHIFT);
-
-#if !ENABLE_VERBS
 	ses->base.cmn.rsvd_res_index = htons(av->addr->start_index <<
 					     UET_SES_REQ_RES_INDEX_SHIFT);
-#else
-	ses->base.cmn.rsvd_res_index = htons(tx_desc->resource_index <<
-					     UET_SES_REQ_RES_INDEX_SHIFT);
-#endif
 
 	ses->base.buf_off = htonll(tx_desc->remote_start_off);
 
@@ -4849,8 +4963,7 @@ static int uet_build_ses_hdr(struct uet_tx_desc *tx_desc, size_t pkt_len,
 		payload_len = pkt_len;
 	} else {
 		if (tx_desc->desc_flags & UET_TX_DESC_FLAG_READ_REQ) {
-			max_payload_len =
-				uet_ep->uet_domain->uet->max_payload_len;
+			max_payload_len = uet_ep->max_payload_len;
 			if (tx_desc->remaining_bytes > max_payload_len)
 				payload_len = max_payload_len;
 			else
@@ -4952,13 +5065,8 @@ static int uet_build_ses_hdr(struct uet_tx_desc *tx_desc, size_t pkt_len,
 
 	ses->cmn.rsvd_opcode = opcode << UET_SES_OPCODE_SHIFT;
 	ses->cmn.ver_flags |= eom;
-#if !ENABLE_VERBS
 	ses->cmn.rsvd_res_index = htons(av->addr->start_index <<
 					UET_SES_REQ_RES_INDEX_SHIFT);
-#else
-	ses->cmn.rsvd_res_index = htons(tx_desc->resource_index <<
-					UET_SES_REQ_RES_INDEX_SHIFT);
-#endif
 	ses->cmn.rsvd_pid_on_fep = htons(av->addr->pid_on_fep <<
 					 UET_SES_REQ_PID_ON_FEP_SHIFT);
 	ses->cmn.msg_id = htons(tx_desc->msg_id);
@@ -5435,7 +5543,8 @@ static int uet_tx_msg(struct uet_tx_desc *tx_desc)
 	} else
 		flags = UET_PDS_FLAG_NONE;
 
-	max_payload_len = uet_ep->uet_domain->uet->max_payload_len;
+	max_payload_len = uet_ep->max_payload_len;
+
 	while (tx_desc->remaining_bytes || !tx_desc->transmitted) {
 		if (tx_desc->remaining_bytes > max_payload_len)
 			payload_len = max_payload_len;
@@ -6254,7 +6363,7 @@ static ssize_t uet_send_req_api_common(
 	 */
 	if ((send_req_api == UET_SEND_API) &&
 	    getenv("UET_FORCE_UUD") &&
-	    (msg_len <= uet_ep->uet_domain->uet->max_payload_len))
+	    (msg_len <= uet_ep->max_payload_len))
 		tx_desc->pds_mode = UET_PDS_MODE_UUD;
 
 	if (tx_desc->pds_mode == UET_PDS_MODE_ROD)
@@ -6938,6 +7047,8 @@ int uet_domain(uet_handle_t handle, struct fid_fabric *fabric,
 	uet_dom->eq_err_callback = eq_err_callback;
 	dlist_init(&uet_dom->ep_list_head);
 	dlist_init(&uet_dom->av_list_head);
+	dlist_init(&uet_dom->mr_list_head);
+	uet_dom->mr_hash_table = NULL;
 	uet_rw_lock_init(&uet_dom->ep_lock);
 
 	/* insert object into domain list */
@@ -6972,13 +7083,39 @@ int uet_domain_close(uet_domain_handle_t domain_handle)
 	return FI_SUCCESS;
 }
 
+size_t uet_max_payload_len(uet_domain_handle_t domain_handle)
+{
+	struct uet_domain *uet_dom = (struct uet_domain *) domain_handle;
+
+	if (uet_dom == NULL)
+		return 0;
+
+	return uet_dom->uet->max_payload_len;
+}
+
+size_t uet_max_msg_size(void)
+{
+	return UET_MAX_MSG_SIZE;
+}
+
+enum uet_encap uet_tx_encap(uet_domain_handle_t domain_handle)
+{
+	struct uet_domain *uet_dom = (struct uet_domain *) domain_handle;
+
+	if (uet_dom == NULL)
+		return UET_ENCAP_IP;
+
+	/* FIXME: IPv4/v6 only right now */
+	return UET_ENCAP_IP;
+}
+
 #if ENABLE_VERBS
 int uet_endpoint(uet_domain_handle_t domain_handle,
 		 struct fi_info *info, struct fid_ep *ep,
 		 void *context, uet_ep_handle_t *ep_handle,
 		 uint16_t pid_on_fep, uint16_t resource_index,
 		 uint32_t initiator_id, uint32_t job_id,
-		 bool absolute, bool is_ipv6)
+		 bool absolute, bool is_ipv6, uint32_t path_mtu)
 #else
 int uet_endpoint(uet_domain_handle_t domain_handle,
 		 struct fi_info *info, struct fid_ep *ep,
@@ -7006,7 +7143,26 @@ int uet_endpoint(uet_domain_handle_t domain_handle,
 
 	/* init ep object */
 	memcpy(&uet_ep->uet_addr, info->src_addr, info->src_addrlen);
+
+	/* The endpoint's own packet size. Everything that segments a message
+	 * reads it from here rather than from the instance, because verbs
+	 * carries a path MTU per queue pair and a queue pair is an endpoint.
+	 * The fabric build has no way to ask for anything else, so it always
+	 * takes the instance's.
+	 */
+	uet_ep->max_payload_len = uet_dom->uet->max_payload_len;
 #if ENABLE_VERBS
+	if (path_mtu != 0) {
+		if (path_mtu > uet_dom->uet->max_payload_len) {
+			UET_API_ERR("endpoint path MTU %u exceeds the instance's %zu",
+				    path_mtu, uet_dom->uet->max_payload_len);
+			rc = -FI_EINVAL;
+			goto err_exit;
+		}
+
+		uet_ep->max_payload_len = path_mtu;
+	}
+
 	uet_ep->uet_addr.pid_on_fep = pid_on_fep;
 	uet_ep->uet_addr.num_indices = 1;
 	uet_ep->uet_addr.start_index = resource_index;
@@ -7278,6 +7434,60 @@ int uet_ep_reset(uet_ep_handle_t ep_handle)
 	uet_ep->tagged_gen_disabled = false;
 
 	return FI_SUCCESS;
+}
+
+ssize_t uet_ep_flush(uet_ep_handle_t ep_handle, size_t max)
+{
+	struct uet_ep *uet_ep = (struct uet_ep *) ep_handle;
+	struct uet_pds *pds;
+	struct uet_ring *ring;
+	struct uet_tx_desc *tx_desc;
+	size_t done = 0;
+
+	if (uet_ep == NULL)
+		return -FI_EINVAL;
+
+	pds = &uet_ep->uet_domain->uet->pds;
+
+	pthread_mutex_lock(&uet_ep->data_lock);
+
+	ring = &uet_ep->tx_ring;
+
+	while ((done < max) && !uet_ring_empty(ring)) {
+		tx_desc = ((struct uet_tx_desc_ring_entry *)
+			   ring->base)[ring->tail].tx_desc;
+
+		/* Take this descriptor's packets off PDS before completing.
+		 * A queued packet holds this descriptor as its handle, and
+		 * the completion below recycles the descriptor onto the free
+		 * list for the next send to take. Any packet still queued
+		 * names an unrelated live transfer, so a late acknowledgement,
+		 * or the retry exhaustion that follows abandoning it, is
+		 * applied to that transfer instead. The result is a wrong
+		 * completion rather than a fault.
+		 */
+		if (pds->downcall.drop_tx_pkts)
+			pds->downcall.drop_tx_pkts(uet_ep,
+						   (uet_pkt_handle_t) tx_desc);
+
+		/* Nothing is coming back for this descriptor so stop
+		 * accounting for what has not been acknowledged.
+		 */
+		tx_desc->desc_flags &= ~UET_TX_DESC_FLAG_CANCEL_PENDING;
+		tx_desc->unack_pkts = 0;
+
+		uet_tx_desc_set_err(tx_desc, FI_ECANCELED,
+				    UET_TX_DESC_STATE_ERR_COMPLETE);
+
+		/* this removes the descriptor from the ring */
+		uet_tx_cq_post_err(tx_desc, tx_desc->err_code);
+
+		done++;
+	}
+
+	pthread_mutex_unlock(&uet_ep->data_lock);
+
+	return (ssize_t)done;
 }
 
 int uet_ep_close(uet_ep_handle_t ep_handle)
@@ -8076,9 +8286,22 @@ int uet_mr_reg_job(uet_domain_handle_t domain_handle, const void *buf,
 
 		mr_desc->job_id = job_id;
 		mr_desc->job_restricted = true;
+		mr_desc->access_class = UET_MR_ACCESS_JOB_RESTRICTED;
 	}
 
 	return rc;
+}
+
+size_t uet_mr_read(uet_mr_handle_t mr_handle, size_t offset, void *buf,
+		   size_t len)
+{
+	struct uet_mr_desc *mr_desc = (struct uet_mr_desc *)mr_handle;
+
+	if ((mr_desc == NULL) || (buf == NULL) ||
+	    (mr_desc->state == UET_MR_DESC_STATE_INACTIVE))
+		return 0;
+
+	return uet_mr_gather(mr_desc, offset, buf, len);
 }
 
 uint64_t uet_mr_key(uet_mr_handle_t mr_handle)
@@ -8107,10 +8330,78 @@ int uet_ep_bind_mr(uet_ep_handle_t ep_handle,
 		return -FI_EINVAL;
 	}
 
+	if (mr_desc->uet_dom != uet_ep->uet_domain) {
+		UET_API_ERR("MR and EP belong to different domains");
+		return -FI_EINVAL;
+	}
+
+	/* Binding to an endpoint is what makes a region RI-restricted.
+	 * A region that named no class is unrestricted and becomes
+	 * RI-restricted here. A job-restricted one keeps its job and becomes
+	 * RI-job-restricted.
+	 */
+	switch (mr_desc->access_class) {
+	case UET_MR_ACCESS_UNRESTRICTED:
+		mr_desc->access_class = UET_MR_ACCESS_RI_RESTRICTED;
+		break;
+	case UET_MR_ACCESS_JOB_RESTRICTED:
+		mr_desc->access_class = UET_MR_ACCESS_RI_JOB_RESTRICTED;
+		break;
+	default:
+		break; /* already restricted to one endpoint */
+	}
+
 	mr_desc->state = UET_MR_DESC_STATE_DISABLED_BIND;
 	mr_desc->uet_ep = uet_ep;
 
 	return FI_SUCCESS;
+}
+
+int uet_mr_set_access(uet_mr_handle_t mr_handle,
+		      uet_mr_access_class_t class, uint32_t job_id)
+{
+	struct uet_mr_desc *mr_desc;
+
+	mr_desc = (struct uet_mr_desc *) mr_handle;
+
+	/* The class decides which lookup space the region is inserted into
+	 * so it has to be settled before enable puts it there.
+	 */
+	if (mr_desc->state != UET_MR_DESC_STATE_DISABLED_REG) {
+		UET_API_ERR("Bad MR state for setting access class");
+		return -FI_EINVAL;
+	}
+
+	switch (class) {
+	case UET_MR_ACCESS_UNRESTRICTED:
+	case UET_MR_ACCESS_RI_RESTRICTED:
+		mr_desc->job_restricted = false;
+		mr_desc->job_id = 0;
+		break;
+
+	case UET_MR_ACCESS_JOB_RESTRICTED:
+	case UET_MR_ACCESS_RI_JOB_RESTRICTED:
+		mr_desc->job_restricted = true;
+		mr_desc->job_id = job_id;
+		break;
+
+	default:
+		UET_API_ERR("Unknown MR access class");
+		return -FI_EINVAL;
+	}
+
+	mr_desc->access_class = class;
+
+	return FI_SUCCESS;
+}
+
+/* let an endpoint resume untagged generation after being resource starved */
+static void uet_ep_untagged_gen_resume(struct uet_ep *uet_ep)
+{
+	if (uet_ep->untagged_gen_disabled) {
+		uet_ep->untagged_gen++;
+		uet_ep->untagged_gen_disabled = false;
+	}
 }
 
 int uet_mr_enable(uet_mr_handle_t mr_handle)
@@ -8120,7 +8411,16 @@ int uet_mr_enable(uet_mr_handle_t mr_handle)
 
 	mr_desc = (struct uet_mr_desc *) mr_handle;
 
-	if (mr_desc->state != UET_MR_DESC_STATE_DISABLED_BIND) {
+	/* An RI-restricted region reaches enable through uet_ep_bind_mr().
+	 * A domain-scoped one has no endpoint to bind to and goes straight
+	 * from registered to enabled.
+	 */
+	if (uet_mr_domain_scoped(mr_desc)) {
+		if (mr_desc->state != UET_MR_DESC_STATE_DISABLED_REG) {
+			UET_API_ERR("Bad MR state for enable");
+			return -FI_EINVAL;
+		}
+	} else if (mr_desc->state != UET_MR_DESC_STATE_DISABLED_BIND) {
 		UET_API_ERR("Bad MR state for enable");
 		return -FI_EINVAL;
 	}
@@ -8152,16 +8452,30 @@ int uet_mr_enable(uet_mr_handle_t mr_handle)
 	 * space (tracked on a list for enumeration/cleanup).
 	 */
 	if (mr_desc->user_key)
-		uet_mr_hash_insert(mr_desc->uet_ep, mr_desc);
+		uet_mr_hash_insert(mr_desc);
 	else
 		uet_mr_list_insert(mr_desc);
 
 	mr_desc->state = UET_MR_DESC_STATE_ENABLED;
 
-	if (mr_desc->uet_ep->untagged_gen_disabled) {
-		/* re-enable generation */
-		mr_desc->uet_ep->untagged_gen++;
-		mr_desc->uet_ep->untagged_gen_disabled = false;
+	/* A new region means resources exist again, so any endpoint that told
+	 * its peers otherwise may resume. For an RI-restricted region that is
+	 * the one endpoint it is bound to and for a domain-scoped region it
+	 * is every endpoint in the domain, since all of them can now serve
+	 * requests against it.
+	 */
+	if (mr_desc->uet_ep)
+		uet_ep_untagged_gen_resume(mr_desc->uet_ep);
+	else {
+		struct dlist_entry *head, *item;
+		struct uet_ep *uet_ep;
+
+		head = &mr_desc->uet_dom->ep_list_head;
+		dlist_foreach(head, item) {
+			uet_ep = container_of(item, struct uet_ep,
+					      ep_list_entry);
+			uet_ep_untagged_gen_resume(uet_ep);
+		}
 	}
 
 	return FI_SUCCESS;

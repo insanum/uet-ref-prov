@@ -1,0 +1,8 @@
+/* A provider exports nothing. libibverbs reaches it through the
+   verbs_device_ops structure its constructor registers, never by symbol
+   lookup, so every symbol stays local. This is a copy of rdma-core's
+   buildlib/provider.map - copied rather than referenced so that building
+   needs only an rdma-core build directory, not its source tree. */
+{
+	local: *;
+};

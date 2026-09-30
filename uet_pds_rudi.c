@@ -95,6 +95,28 @@ void uet_pds_rudi_finalize(void)
 	}
 }
 
+size_t uet_pds_rudi_drop_tx_pkts(uet_pkt_handle_t tx_pkt_handle)
+{
+	struct uet_rudi_out_pkt *rp, *tmp;
+	size_t dropped = 0;
+
+	if (tx_pkt_handle == NULL)
+		return 0;
+
+	HASH_ITER(hh, rudi.out_ht, rp, tmp) {
+		if (rp->tx_pkt_handle != tx_pkt_handle)
+			continue;
+
+		HASH_DEL(rudi.out_ht, rp);
+		dlist_remove(&rp->node);
+		free(rp->pkt_buf);
+		free(rp);
+		dropped++;
+	}
+
+	return dropped;
+}
+
 /* FIXME: get the security SDI/SSI, same source as uet_pdsm_get_sdi()! */
 static void uet_rudi_get_sec(bool *sec_enabled, uint32_t *sdi, uint32_t *ssi)
 {
@@ -528,6 +550,7 @@ int uet_pds_rudi_progress_tx(struct uet_ep *uet_ep,
 	struct uet_instance *uet = uet_ep->uet_domain->uet;
 	struct uet_rudi_out_pkt *rp;
 	struct dlist_entry *tmp;
+	uet_pkt_handle_t failed;
 	time_t now;
 	int rc;
 
@@ -543,19 +566,28 @@ int uet_pds_rudi_progress_tx(struct uet_ep *uet_ep,
 			break;
 
 		if (rp->tx_retry_cnt >= uet->pds.max_tx_retries) {
+			failed = rp->tx_pkt_handle;
+
 			UET_PDS_ERR("RUDI: pkt_id %u exceeded max retries",
 				    rp->pkt_id);
 
 			if (err_pkt_handle)
-				*err_pkt_handle = rp->tx_pkt_handle;
-
-			uet->pds.upcall.pds_err(rp->tx_pkt_handle,
-						UET_PDS_ERR_NONE);
+				*err_pkt_handle = failed;
 
 			HASH_DEL(rudi.out_ht, rp);
 			dlist_remove(&rp->node);
 			free(rp->pkt_buf);
 			free(rp);
+
+			/* Everything else outstanding for this message goes
+			 * as well. The upcall below fails the whole message.
+			 */
+			uet_pds_rudi_drop_tx_pkts(failed);
+
+			/* This upcall completes the descriptor and hands it
+			 * back for reuse.
+			 */
+			uet->pds.upcall.pds_err(failed, UET_PDS_ERR_NONE);
 
 			return -EPROTO;
 		}

@@ -204,6 +204,78 @@ $(CC_SIM_BIN): $(CC_SIM_OBJ)
 	@echo 'Building program: $@'
 	@$(CC) $(CC_SIM_OBJ) -o $@ $(LDFLAGS)
 
+# UET reference device model
+#
+# Deliberately NOT part of "all", the default build. The userspace regression
+# matrix stays exactly as it was. Build the PCIe device model with "make dev".
+
+UET_DEV_DIR=uet_vfio
+UET_DEV_OBJ_DIR=obj_uet_dev
+UET_DEV_BIN=uet_dev
+
+# Auto-discover the libvfio-user build tree by searching up parent
+# directories. A checkout may sit beside this repository or a level or two
+# down inside a workspace, so each level is searched to a small depth rather
+# than for siblings alone.
+#
+# What is looked for is a *build* tree - build/lib is where "meson compile"
+# leaves the library, and this model is normally built against that without
+# an install step. An installed prefix has a different shape, so name it:
+#     make dev LIBVFIO_USER=/usr/local LIBVFIO_USER_LIB=/usr/local/lib
+#     make dev LIBVFIO_USER_INC=... LIBVFIO_USER_LIB=...
+#
+# Only "make dev" needs any of this so this search does not run for the
+# other build targets.
+
+ifeq ($(filter dev,$(MAKECMDGOALS)),dev)
+ifndef LIBVFIO_USER
+LIBVFIO_USER := $(shell \
+	current_dir=$(CURDIR); \
+	while [ "$$current_dir" != "/" ]; do \
+		for dir in $$current_dir/libvfio-user* \
+			   $$current_dir/*/libvfio-user* \
+			   $$current_dir/*/*/libvfio-user*; do \
+			if [ -d "$$dir/build/lib" ]; then \
+				echo "$$dir"; \
+				exit 0; \
+			fi; \
+		done; \
+		current_dir=$$(dirname $$current_dir); \
+	done; \
+)
+ifeq ($(LIBVFIO_USER),)
+$(error a libvfio-user build tree was not found; set LIBVFIO_USER=<path>)
+endif
+$(info Found libvfio-user directory: $(LIBVFIO_USER))
+else
+$(info Using libvfio-user directory from environment: $(LIBVFIO_USER))
+endif
+endif
+
+LIBVFIO_USER_INC ?= $(LIBVFIO_USER)/include
+LIBVFIO_USER_LIB ?= $(LIBVFIO_USER)/build/lib
+
+UET_DEV_HDRS=$(wildcard $(UET_DEV_DIR)/*.h)
+UET_DEV_SRCS=$(wildcard $(UET_DEV_DIR)/*.c)
+UET_DEV_OBJS=$(patsubst $(UET_DEV_DIR)/%.c,$(UET_DEV_OBJ_DIR)/%.o,$(UET_DEV_SRCS))
+
+# device model object files are built against the verbs flavor of the library
+$(UET_DEV_OBJ_DIR)/%.o: $(UET_DEV_DIR)/%.c $(HDRS) $(UET_DEV_HDRS)
+	@mkdir -p $(UET_DEV_OBJ_DIR)
+	@echo 'Building device model file: $<'
+	@$(CC) $(CFLAGS) -DENABLE_VERBS=1 -I$(UET_DEV_DIR) $(INCS) $(LF_HDRS) \
+	       -I$(LIBVFIO_USER_INC) -c -o $@ $<
+
+# vfio-user device model
+$(UET_DEV_BIN): $(VERBS_LIB) $(UET_DEV_OBJS)
+	@echo 'Building device model: $@'
+	@$(CC) $(UET_DEV_OBJS) \
+	       -o $@ -L. -l$(VERBS_LIBNAME) \
+	       -L$(LIBVFIO_USER_LIB) -lvfio-user \
+	       -Wl,-rpath,$(LIBVFIO_USER_LIB) $(LDFLAGS) $(LF_LIBS)
+
+dev: $(UET_DEV_BIN)
+
 clean:
 	@rm -rf $(FABRIC_LIB_OBJ_DIR) $(FABRIC_LIB) \
 		$(VERBS_LIB_OBJ_DIR) $(VERBS_LIB) \
@@ -212,6 +284,8 @@ clean:
 		$(XDP_LIB_OBJ_DIR) $(XDP_LIB) \
 		$(XDP_OBJ_DIR) $(XDP_BIN) \
 		$(XDP_KERN_BIN) \
-		$(CC_SIM_OBJ_DIR) $(CC_SIM_BIN)
+		$(CC_SIM_OBJ_DIR) $(CC_SIM_BIN) \
+		$(UET_DEV_OBJ_DIR) $(UET_DEV_BIN)
 
-.PHONY: all xdp strict-core cc_sim clean
+.PHONY: all xdp strict-core cc_sim dev clean
+

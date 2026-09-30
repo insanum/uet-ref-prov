@@ -710,6 +710,105 @@ static void uet_pdsm_free_pdc(struct uet_pdc *pdc)
 	dlist_insert_tail(&pdc->node, &pds_state.pdc_free_head);
 }
 
+/*
+ * Fail and release every packet still queued on a PDC. Tell SES about each
+ * one so the message above it completes rather than waiting for an
+ * acknowledgement that is not coming.
+ */
+static void uet_pdsm_drain_tx_pkts(struct uet_instance *uet,
+				   struct uet_pdc *pdc)
+{
+	struct uet_pdc_pkt *pdc_pkt;
+	struct dlist_entry *tmp;
+
+	dlist_foreach_container_safe(&pdc->tx_pkt_list_head,
+				     struct uet_pdc_pkt, pdc_pkt,
+				     node, tmp) {
+		if (PSN_IN_MPR(pdc_pkt->psn, pdc->tx_bm_base_psn))
+			bm_unset(pdc->tx_bm,
+				 (pdc_pkt->psn - pdc->tx_bm_base_psn));
+
+		dlist_remove(&pdc_pkt->node);
+
+		if (uet->pds.upcall.pds_err && pdc_pkt->tx_pkt_handle)
+			uet->pds.upcall.pds_err(pdc_pkt->tx_pkt_handle,
+						UET_PDS_ERR_NONE);
+
+		if (pdc_pkt->ack_buf)
+			free(pdc_pkt->ack_buf);
+		if (pdc_pkt->pkt_buf)
+			free(pdc_pkt->pkt_buf);
+		free(pdc_pkt);
+	}
+}
+
+/* Drop every queued packet that names a SES transmit descriptor. SES calls
+ * this when it abandons a transmit. No pds_err upcall is made for packets
+ * that are dropped here.
+ */
+size_t uet_pds_drop_tx_pkts(struct uet_ep *uet_ep,
+			    uet_pkt_handle_t tx_pkt_handle)
+{
+	struct uet_pdc *pdc;
+	struct uet_pdc_pkt *pdc_pkt;
+	struct dlist_entry *pdc_tmp, *pkt_tmp;
+	size_t dropped = 0;
+
+	(void)uet_ep;	/* contexts are per-peer, not per-endpoint */
+
+	if (tx_pkt_handle == NULL)
+		return 0;
+
+	dlist_foreach_container_safe(&pds_state.pdc_alloc_head,
+				     struct uet_pdc, pdc, node, pdc_tmp) {
+		dlist_foreach_container_safe(&pdc->tx_pkt_list_head,
+					     struct uet_pdc_pkt, pdc_pkt,
+					     node, pkt_tmp) {
+			if (pdc_pkt->tx_pkt_handle != tx_pkt_handle)
+				continue;
+
+			if (PSN_IN_MPR(pdc_pkt->psn, pdc->tx_bm_base_psn)) {
+				bm_unset(pdc->tx_bm,
+					 (pdc_pkt->psn - pdc->tx_bm_base_psn));
+			}
+
+			dlist_remove(&pdc_pkt->node);
+
+			if (pdc_pkt->ack_buf)
+				free(pdc_pkt->ack_buf);
+
+			if (pdc_pkt->pkt_buf)
+				free(pdc_pkt->pkt_buf);
+
+			free(pdc_pkt);
+			dropped++;
+		}
+	}
+
+	/* RUDI keeps its outstanding requests off the contexts entirely */
+	dropped += uet_pds_rudi_drop_tx_pkts(tx_pkt_handle);
+
+	return dropped;
+}
+
+/* Drain/discard a failed PDC allowing the peer to be reached again. */
+static void uet_pdsm_discard_pdc(struct uet_instance *uet,
+				 struct uet_pdc *pdc)
+{
+	struct uet_msgid_map *msgid_map, *msgid_tmp;
+
+	uet_pdsm_drain_tx_pkts(uet, pdc);
+
+	HASH_ITER(msgid_hh, pds_state.pdc_msgid_ht, msgid_map, msgid_tmp) {
+		if (msgid_map->pdc != pdc)
+			continue;
+		HASH_DELETE(msgid_hh, pds_state.pdc_msgid_ht, msgid_map);
+		free(msgid_map);
+	}
+
+	uet_pdsm_free_pdc(pdc);
+}
+
 /* FIXME: get the security SDI/SSI based on JobID */
 static void uet_pdsm_get_sdi(struct uet_pdc *pdc)
 {
@@ -755,21 +854,24 @@ static struct uet_pdc *uet_pdsm_assign_ini_pdc(struct uet_ep *uet_ep,
 	HASH_FIND(pdc_ini_hh, pds_state.pdc_ini_ht, &pdc_key,
 		  sizeof(pdc_key), pdc);
 	if (pdc) {
-		/* if the PDC is in the error state, don't use it */
+		/*
+		 * An errored PDC is finished, so throw it away here and
+		 * establish a new one below rather than refusing.
+		 */
 		if (pdc->state == PDC_STATE_ERROR) {
-			UET_PDS_DBG("initiator lookup found an errored PDC %u",
-				    pdc->pdc_id);
-			return NULL;
-		}
-
-		/* if the PDC is closing, don't use it for new messages */
-		if (pdc->close_requested) {
+			UET_PDS_WARN("discarding errored PDC %u and "
+				     "establishing a new one",
+				     pdc->pdc_id);
+			uet_pdsm_discard_pdc(uet_ep->uet_domain->uet, pdc);
+			pdc = NULL;
+		} else if (pdc->close_requested) {
+			/* closing, usable again once it has finished */
 			UET_PDS_DBG("initiator lookup found a closing PDC %u",
 				    pdc->pdc_id);
 			return NULL;
+		} else {
+			return pdc;
 		}
-
-		return pdc;
 	}
 
 	/* allocate a new PDC from the head of the free list */
@@ -2258,6 +2360,10 @@ static int uet_pds_check_rtx_pkt(struct uet_instance *uet,
 	time_t now, delta;
 	int rc;
 
+	/* never retransmit something the peer has already acknowledged */
+	if (pdc_pkt->tx_pkt_acked)
+		return 0;
+
 	uet_gettime(&now);
 	delta = (now - pdc_pkt->tx_time);
 	if (delta < uet->pds.tx_timeout)
@@ -2293,6 +2399,7 @@ int uet_pds_progress_tx_pkt(struct uet_instance *uet,
 			    struct uet_pdc *pdc,
 			    struct uet_pdc_pkt *pdc_pkt)
 {
+	uet_pkt_handle_t failed;
 	int rc;
 
 	rc = uet_pds_check_rtx_pkt(uet, pdc, pdc_pkt);
@@ -2300,6 +2407,8 @@ int uet_pds_progress_tx_pkt(struct uet_instance *uet,
 		return 0; /* no retransmit, done with this PDC */
 
 	if (rc == -EIO) {
+		failed = pdc_pkt->tx_pkt_handle;
+
 		/*
 		 * Max retries exceeded - transition this PDC to the error
 		 * state and notify the SES layer.
@@ -2308,6 +2417,9 @@ int uet_pds_progress_tx_pkt(struct uet_instance *uet,
 			    "(max retries exceeded)",
 			    pdc->pdc_id);
 		uet_pds_close_pdc_in_error(uet, pdc);
+
+		/* the rest of this message's pkts go with this failed one */
+		uet_pds_drop_tx_pkts(NULL, failed);
 
 		/*
 		 * Will return immediately to give the SES layer a chance to
@@ -2319,7 +2431,13 @@ int uet_pds_progress_tx_pkt(struct uet_instance *uet,
 	/* (rc == -EAGAIN)
 	 * This packet was retransmitted so it's moved to the end of
 	 * the pending list. Continue to the next packet.
+	 *
+	 * Possible its acknowledgement arrived while it was being resent, in
+	 * which case the ack path has already taken it off this list.
 	 */
+	if (pdc_pkt->tx_pkt_acked)
+		return -EAGAIN;
+
 	dlist_remove(&pdc_pkt->node);
 	dlist_insert_tail(&pdc_pkt->node,
 			  &pdc->tx_pkt_list_head);
@@ -3289,26 +3407,7 @@ static void uet_pds_close_pdc_in_error(struct uet_instance *uet,
 	UET_PDS_ERR("PDC %u closing in error", pdc->pdc_id);
 	pds_state.pdc_close_in_err_cnt++;
 
-	/* fail and free all outstanding Tx packets, notifying SES */
-	dlist_foreach_container_safe(&pdc->tx_pkt_list_head,
-				     struct uet_pdc_pkt, pdc_pkt,
-				     node, tmp) {
-		if (PSN_IN_MPR(pdc_pkt->psn, pdc->tx_bm_base_psn))
-			bm_unset(pdc->tx_bm,
-				 (pdc_pkt->psn - pdc->tx_bm_base_psn));
-
-		dlist_remove(&pdc_pkt->node);
-
-		if (uet->pds.upcall.pds_err && pdc_pkt->tx_pkt_handle)
-			uet->pds.upcall.pds_err(pdc_pkt->tx_pkt_handle,
-						UET_PDS_ERR_NONE);
-
-		if (pdc_pkt->ack_buf)
-			free(pdc_pkt->ack_buf);
-		if (pdc_pkt->pkt_buf)
-			free(pdc_pkt->pkt_buf);
-		free(pdc_pkt);
-	}
+	uet_pdsm_drain_tx_pkts(uet, pdc);
 
 	/*
 	 * The Close Command/Request sent on the first pass has itself
